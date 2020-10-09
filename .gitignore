@@ -1,0 +1,10 @@
+
+*.db
+*.ipch
+*.obj
+*.tlog
+*.exe
+*.pdb
+*.log
+*.res
+.vs/mimikatz/v16/.suo

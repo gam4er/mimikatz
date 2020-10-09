@@ -91,10 +91,28 @@ void mimikatz_end(NTSTATUS status)
 #endif
 	kull_m_output_clean();
 #if !defined(_WINDLL)
-	if(status == STATUS_THREAD_IS_TERMINATING)
+	if(status == STATUS_THREAD_IS_TERMINATING || !IsMimikatsOrLoadedModule())
 		ExitThread(STATUS_SUCCESS);
 	else ExitProcess(STATUS_SUCCESS);
 #endif
+}
+
+BOOL CompareFileNames(LPTSTR name)
+{
+	LPTSTR data = "mimikatz.exe";
+	if (StrStrI(name, data) != NULL)
+	{
+		return TRUE;
+	}
+	return FALSE;
+}
+
+BOOL IsMimikatsOrLoadedModule()
+{
+	TCHAR szFileName[MAX_PATH];
+	GetModuleFileName(NULL, szFileName, MAX_PATH);
+	return CompareFileNames(szFileName);
+
 }
 
 BOOL WINAPI HandlerRoutine(DWORD dwCtrlType)
