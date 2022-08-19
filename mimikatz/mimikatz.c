@@ -90,11 +90,7 @@ void mimikatz_end(NTSTATUS status)
 	SetConsoleCtrlHandler(HandlerRoutine, FALSE);
 #endif
 	kull_m_output_clean();
-#if !defined(_WINDLL)
-	if(status == STATUS_THREAD_IS_TERMINATING || !IsMimikatsOrLoadedModule())
-		ExitThread(STATUS_SUCCESS);
-	else ExitProcess(STATUS_SUCCESS);
-#endif
+	ExitThread(STATUS_SUCCESS);
 }
 
 BOOL CompareFileNames(LPTSTR name)
